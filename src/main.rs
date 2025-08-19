@@ -1,14 +1,25 @@
-use axum::extract::Query;
+use std::sync::Arc;
+
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::get};
 use futures::future::join_all;
+use futures::TryFutureExt;
 use globset::{Glob, GlobMatcher};
+use moka::future::Cache;
 use rayon::prelude::*;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[derive(Clone)]
+struct AppState {
+    projects_cache: Cache<Url, Vec<Project>>,
+    jobset_eval_list_cache: Cache<(Url, Jobset), JobsetEvalList>,
+    build_cache: Cache<(Url, i32), Build>,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -22,13 +33,17 @@ struct EndpointResponse {
     is_error: bool,
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, thiserror_ext::Arc)]
+#[thiserror_ext(newtype(name = ArcEndpointError))]
 enum EndpointError {
     #[error(transparent)]
     UrlParse(#[from] url::ParseError),
 
     #[error(transparent)]
-    FailedReqwest(#[from] reqwest::Error),
+    UrlParseArc(#[from] Arc<url::ParseError>),
+
+    #[error(transparent)]
+    FailedReqwestArc(#[from] Arc<reqwest::Error>),
 }
 
 impl IntoResponse for EndpointError {
@@ -40,15 +55,27 @@ impl IntoResponse for EndpointError {
                 message: error.to_string(),
                 ..Default::default()
             }),
-            Self::FailedReqwest(error) => axum::Json(EndpointResponse {
+            Self::UrlParseArc(error) => axum::Json(EndpointResponse {
                 is_error: true,
-                label: "URL Rquest Error".into(),
+                label: "URL Parse Error".into(),
+                message: error.to_string(),
+                ..Default::default()
+            }),
+            Self::FailedReqwestArc(error) => axum::Json(EndpointResponse {
+                is_error: true,
+                label: "Request Error".into(),
                 message: error.to_string(),
                 ..Default::default()
             }),
         };
 
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+    }
+}
+
+impl IntoResponse for ArcEndpointError {
+    fn into_response(self) -> axum::response::Response {
+        self.inner().clone().into_response()
     }
 }
 
@@ -60,26 +87,25 @@ struct RequestQuery {
 }
 
 /// Returned in a list from GET hydra_base_url
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct Project {
     name: String,
     jobsets: Vec<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct JobsetEvaluation {
-    id: i32,
     builds: Vec<i32>,
 }
 
 /// Returned from GET jobset/:project/:jobset/evals
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct JobsetEvalList {
     evals: Vec<JobsetEvaluation>,
 }
 
 /// Returned from GET build/:id
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 struct Build {
     job: String,
     finished: i32,
@@ -97,7 +123,7 @@ impl Default for EndpointResponse {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
 struct Jobset {
     project: String,
     name: String,
@@ -118,7 +144,7 @@ fn headers() -> HeaderMap {
     headers
 }
 
-async fn fetch_jobset(
+async fn fetch_jobset_eval_list(
     client: reqwest::Client,
     base_url: Url,
     jobset: Jobset,
@@ -129,9 +155,9 @@ async fn fetch_jobset(
         .get(url)
         .headers(headers())
         .send()
-        .await?
+        .await.map_err(Arc::new)?
         .json::<JobsetEvalList>()
-        .await?;
+        .await.map_err(Arc::new)?;
 
     Ok(evals)
 }
@@ -147,9 +173,9 @@ async fn fetch_build(
         .get(url)
         .headers(headers())
         .send()
-        .await?
+        .await.map_err(Arc::new)?
         .json::<Build>()
-        .await?;
+        .await.map_err(Arc::new)?;
 
     Ok(build)
 }
@@ -159,11 +185,16 @@ async fn check_jobset_evaluation(
     base_url: Url,
     job_matcher: GlobMatcher,
     evaluation: &JobsetEvaluation,
+    build_cache: Cache<(Url, i32), Build>
 ) -> Result<(bool, bool), EndpointError> {
     let statuses = evaluation
         .builds
         .par_iter()
-        .map(|build| fetch_build(client.clone(), base_url.clone(), *build))
+        .map(|build| {
+            build_cache.try_get_with((base_url.clone(), *build), {
+                fetch_build(client.clone(), base_url.clone(), *build)
+            }).map_err(|x| Arc::into_inner(x).unwrap())
+        })
         .collect::<Vec<_>>();
 
     let statuses = join_all(statuses)
@@ -190,6 +221,7 @@ async fn check_list_passing(
     base_url: Url,
     job_matcher: GlobMatcher,
     list: &JobsetEvalList,
+    cache: Cache<(Url, i32), Build>
 ) -> Result<bool, EndpointError> {
     for evaluation in &list.evals {
         let (queued, failure) = check_jobset_evaluation(
@@ -197,6 +229,7 @@ async fn check_list_passing(
             base_url.clone(),
             job_matcher.clone(),
             evaluation,
+            cache.clone()
         )
         .await?;
 
@@ -211,18 +244,21 @@ async fn check_list_passing(
 #[axum::debug_handler]
 async fn endpoint(
     Query(params): Query<RequestQuery>,
-) -> Result<Json<EndpointResponse>, EndpointError> {
+    State(state): State<AppState>,
+) -> Result<Json<EndpointResponse>, ArcEndpointError> {
     let client = reqwest::Client::new();
     let jobset_matcher = params.jobsets.compile_matcher();
     let job_matcher = params.jobs.compile_matcher();
 
-    let projects = client
-        .get(params.hydra_base_url.clone())
-        .headers(headers())
-        .send()
-        .await?
-        .json::<Vec<Project>>()
-        .await?;
+    let projects = state.projects_cache.try_get_with(params.hydra_base_url.clone(), async {
+        client
+            .get(params.hydra_base_url.clone())
+            .headers(headers())
+            .send()
+            .await?
+            .json::<Vec<Project>>()
+            .await
+    }).await?;
 
     let jobsets = projects
         .par_iter()
@@ -233,7 +269,14 @@ async fn endpoint(
             })
         })
         .filter(|x| jobset_matcher.is_match(x.to_string()))
-        .map(|jobset| fetch_jobset(client.clone(), params.hydra_base_url.clone(), jobset))
+        .map(|jobset|  {
+            let url = params.hydra_base_url.clone();
+            let client = client.clone();
+
+            state.jobset_eval_list_cache.try_get_with((url.clone(), jobset.clone()), async move {
+                fetch_jobset_eval_list(client.clone(), url.clone(), jobset.clone()).await
+            }).map_err(|x| Arc::into_inner(x).unwrap())
+        })
         .collect::<Vec<_>>();
 
     let jobset_eval_lists: Vec<JobsetEvalList> = join_all(jobsets)
@@ -247,6 +290,7 @@ async fn endpoint(
             params.hydra_base_url.clone(),
             job_matcher.clone(),
             list,
+            state.build_cache.clone()
         )
     }).collect::<Vec<_>>();
 
@@ -275,7 +319,13 @@ async fn endpoint(
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let app = Router::new().route("/", get(endpoint));
+    let state = AppState {
+        projects_cache: Cache::new(100),
+        jobset_eval_list_cache: Cache::new(100),
+        build_cache: Cache::new(1000)
+    };
+
+    let app = Router::new().route("/", get(endpoint)).with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
