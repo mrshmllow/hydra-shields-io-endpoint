@@ -1,0 +1,17 @@
+[package]
+name = "hydra-shields-endpoint"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.99"
+axum = { version = "0.8.4", features = ["macros"] }
+futures = "0.3.31"
+globset = { version = "0.4.16", features = ["serde1"] }
+rayon = "1.11.0"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0.15"
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3.19"
+url = { version = "2.5.4", features = ["serde"] }
